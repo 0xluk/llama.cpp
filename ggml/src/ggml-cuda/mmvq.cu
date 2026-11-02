@@ -586,6 +586,11 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ2_XXS: // i-quant MMVQ is ALU/latency bound on sm_86
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
             return true;
         default:
             return false;

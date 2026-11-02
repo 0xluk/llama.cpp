@@ -1215,7 +1215,7 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
     GGML_ASSERT(comm_ctx->ar_pipeline != nullptr);
 
     const size_t n_backends = comm_ctx->backends.size();
-    GGML_ASSERT(n_backends == 2);
+    GGML_ASSERT(n_backends >= 2);
     GGML_ASSERT(tensors[0] != nullptr);
 
     const int64_t   ne   = ggml_nelements(tensors[0]);
@@ -1266,6 +1266,22 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
 #ifdef GGML_USE_NCCL
 static bool ggml_backend_cuda_comm_try_allreduce_nccl(
         ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    return ggml_backend_cuda_comm_allreduce_nccl(comm_ctx, tensors);
+}
+#endif // GGML_USE_NCCL
+
+#ifdef GGML_USE_NCCL
+static bool ggml_backend_cuda_comm_allreduce_internal(ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors);
+static bool ggml_backend_cuda_comm_try_allreduce_hybrid(
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    static const size_t thr = [] {
+        const char * e = getenv("GGML_CUDA_AR_HYBRID_BYTES");
+        return e ? (size_t) strtoull(e, nullptr, 10) : (size_t) 1024*1024;
+    }();
+    if (comm_ctx->ar_pipeline && ggml_nbytes(tensors[0]) < thr &&
+            ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors)) {
+        return true;
+    }
     return ggml_backend_cuda_comm_allreduce_nccl(comm_ctx, tensors);
 }
 #endif // GGML_USE_NCCL
@@ -1371,6 +1387,17 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
         std::string env_str(env);
         if (env_str == "nccl") {
             ggml_backend_cuda_comm_init_nccl(ret);
+        } else if (env_str == "hybrid") {
+            ggml_backend_cuda_comm_init_nccl(ret);
+#ifdef GGML_USE_NCCL
+            if (ret->try_allreduce == ggml_backend_cuda_comm_try_allreduce_nccl) {
+                ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size());
+                if (ret->ar_pipeline) {
+                    ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_hybrid;
+                    GGML_LOG_INFO("AllReduce: hybrid (internal < GGML_CUDA_AR_HYBRID_BYTES, NCCL above)\n");
+                }
+            }
+#endif // GGML_USE_NCCL
         } else if (env_str == "internal") {
             ggml_backend_cuda_comm_init_internal(ret);
         } else if (env_str == "none") {
