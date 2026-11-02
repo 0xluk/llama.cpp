@@ -11,10 +11,10 @@
 #include <limits>
 
 // ---------------------------------------------------------------------------
-// AllReduce for tensor-parallel inference across two GPUs (CUDA or
+// AllReduce for tensor-parallel inference across 2 to 8 GPUs (CUDA or
 // ROCm/HIP).
 //
-// Provides an in-place sum reduction over matching tensors on two GPUs
+// Provides an in-place sum reduction over matching tensors on 2 to 8 GPUs
 // in the same process.  Used by the tensor-split path alongside NCCL;
 // targets setups without NVLink/xGMI, where data is exchanged between the
 // GPUs by staging it through pinned host memory over PCIe.
@@ -222,14 +222,169 @@ static __global__ void ggml_cuda_ar_add_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Chunked kernel AllReduce -- 3 to 8 GPUs (one-shot).
+//
+// Same phases as ggml_cuda_ar_kernel, but each rank waits for all N-1 peers
+// and then reads all N-1 peer buffers.  The sum uses the same pairwise order
+// as the meta-backend butterfly (e.g. (x0+x2)+(x1+x3) for N=4), so with an
+// F32 wire the result is bit-identical to the butterfly and to every other
+// rank.
+// ---------------------------------------------------------------------------
+static constexpr int GGML_CUDA_AR_MAX_DEVICES = 8;
+
+struct ggml_cuda_ar_peer_ptrs {
+    const void * data[GGML_CUDA_AR_MAX_DEVICES];    // per-rank wire buffer for this slot
+    const int  * arrival[GGML_CUDA_AR_MAX_DEVICES]; // per-rank arrival base for this slot
+};
+
+// Fold ranks >= P (largest power of 2 <= N) into the low ranks, then sum pairwise like the butterfly.
+template <int N>
+static __device__ __forceinline__ float ggml_cuda_ar_tree_sum(float (&acc)[N]) {
+    constexpr int P = N >= 8 ? 8 : (N >= 4 ? 4 : 2);
+    #pragma unroll
+    for (int j = P; j < N; ++j) {
+        acc[j - P] = acc[j - P] + acc[j];
+    }
+    #pragma unroll
+    for (int s = P/2; s >= 1; s /= 2) {
+        #pragma unroll
+        for (int j = 0; j < s; ++j) {
+            acc[j] = acc[j] + acc[j + s];
+        }
+    }
+    return acc[0];
+}
+
+template <int N, typename T_dst, typename T_wire>
+static __global__ void ggml_cuda_ar_kernel_n(
+        const T_dst  *               sendbuf,
+        T_dst        *               recvbuf,
+        T_wire       * __restrict__  host_mine,
+        const ggml_cuda_ar_peer_ptrs peers,
+        int                          rank,
+        int                          count,
+        int *                        arrival_mine,
+        int                          token) {
+
+    constexpr int ELEMS_PER_VEC = ggml_cuda_get_max_cpy_bytes() / sizeof(T_wire);
+    constexpr int ARRIVAL_INTS  = (int)(GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int));
+
+    const int tid       = threadIdx.x;
+    const int nt        = blockDim.x;
+    const int bid       = blockIdx.x;
+    const int gtid      = bid * nt + tid;
+    const int gnt       = gridDim.x * nt;
+    const int count_vec = count / ELEMS_PER_VEC;
+    const int tail      = count_vec * ELEMS_PER_VEC;
+
+    // Phase 1: cast sendbuf (T_dst) -> host_mine (T_wire) and store as vectors.
+    for (int i = gtid; i < count_vec; i += gnt) {
+        const int off = i * ELEMS_PER_VEC;
+        T_wire wire[ELEMS_PER_VEC];
+        #pragma unroll
+        for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+            wire[k] = ggml_cuda_cast<T_wire>(sendbuf[off + k]);
+        }
+        ggml_cuda_memcpy_1<sizeof(wire)>(&host_mine[off], wire);
+    }
+    if (bid == 0 && tid < count - tail) {
+        host_mine[tail + tid] = ggml_cuda_cast<T_wire>(sendbuf[tail + tid]);
+    }
+
+    __threadfence_system();
+    __syncthreads();
+
+    // Phase 2: signal own slot, then spin until every peer has signalled.
+    if (tid == 0) {
+        ggml_cuda_ar_signal_set(arrival_mine + bid * ARRIVAL_INTS, token);
+        __threadfence_system();
+
+        for (int r = 0; r < N; ++r) {
+            if (r == rank) {
+                continue;
+            }
+            const int * other_slot = peers.arrival[r] + bid * ARRIVAL_INTS;
+            while (ggml_cuda_ar_signal_get(other_slot) != token) {
+#ifdef GGML_USE_HIP
+                __builtin_amdgcn_s_sleep(4);
+#elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+                __nanosleep(100);
+#else
+                NO_DEVICE_CODE;
+#endif // GGML_USE_HIP
+            }
+        }
+    }
+
+    __syncthreads();
+    __threadfence_system();
+
+    // Phase 3: read all peer vectors, round own value through T_wire, sum in butterfly order.
+    for (int i = gtid; i < count_vec; i += gnt) {
+        const int off = i * ELEMS_PER_VEC;
+        T_wire w[N][ELEMS_PER_VEC];
+        #pragma unroll
+        for (int r = 0; r < N; ++r) {
+            if (r == rank) {
+                #pragma unroll
+                for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+                    w[r][k] = ggml_cuda_cast<T_wire>(sendbuf[off + k]);
+                }
+            } else {
+                ggml_cuda_memcpy_1<sizeof(w[r])>(w[r], (const T_wire *) peers.data[r] + off);
+            }
+        }
+        #pragma unroll
+        for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+            float acc[N];
+            #pragma unroll
+            for (int r = 0; r < N; ++r) {
+                acc[r] = ggml_cuda_cast<float>(w[r][k]);
+            }
+            recvbuf[off + k] = ggml_cuda_cast<T_dst>(ggml_cuda_ar_tree_sum<N>(acc));
+        }
+    }
+    if (bid == 0 && tid < count - tail) {
+        float acc[N];
+        #pragma unroll
+        for (int r = 0; r < N; ++r) {
+            acc[r] = r == rank ? ggml_cuda_cast<float>(ggml_cuda_cast<T_wire>(sendbuf[tail + tid]))
+                               : ggml_cuda_cast<float>(((const T_wire *) peers.data[r])[tail + tid]);
+        }
+        recvbuf[tail + tid] = ggml_cuda_cast<T_dst>(ggml_cuda_ar_tree_sum<N>(acc));
+    }
+}
+
+// N-way add for the copy-engine path.  tmp holds one stride-sized slot per rank (own slot unused); own value comes from dst.
+template <int N, typename T_dst, typename T_src>
+static __global__ void ggml_cuda_ar_add_kernel_n(
+        T_dst       * __restrict__ dst,
+        const T_src * __restrict__ tmp,
+        int                        rank,
+        int64_t                    stride,
+        int                        count) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int nt  = gridDim.x * blockDim.x;
+    for (int i = tid; i < count; i += nt) {
+        float acc[N];
+        #pragma unroll
+        for (int r = 0; r < N; ++r) {
+            acc[r] = r == rank ? ggml_cuda_cast<float>(ggml_cuda_cast<T_src>(dst[i]))
+                               : ggml_cuda_cast<float>(tmp[(int64_t) r * stride + i]);
+        }
+        dst[i] = ggml_cuda_cast<T_dst>(ggml_cuda_ar_tree_sum<N>(acc));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pipeline structure
 // ---------------------------------------------------------------------------
 
 // Number of slots in the event / arrival ring.  Two slots is sufficient:
-// lockstep guarantees the two GPUs are at most one AR (or chunk) apart, so
-// slot[N%2] is always safe to reuse -- peer has already consumed slot[N%2]
+// lockstep guarantees all GPUs are at most one AR (or chunk) apart, so
+// slot[N%2] is always safe to reuse -- every peer has already consumed slot[N%2]
 // from AR N-2 by the time we get to AR N.  acquire_slot's
-// cudaEventSynchronize on ev.ker for both devices makes that consumption
+// cudaEventSynchronize on ev.ker for all devices makes that consumption
 // explicit before we overwrite host_buf[slot] for the new AR.
 static constexpr int GGML_CUDA_AR_POOL_SIZE = 2;
 
@@ -399,9 +554,9 @@ static void ggml_cuda_ar_wait_for_compute(
 
 ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n_devices) {
 
-    if (n_devices != 2) {
-        GGML_LOG_DEBUG("%s: internal AllReduce only supports n_devices=2 (got %zu); "
-                       "falling back\n", __func__, n_devices);
+    if (n_devices < 2 || n_devices > (size_t) GGML_CUDA_AR_MAX_DEVICES) {
+        GGML_LOG_DEBUG("%s: internal AllReduce supports 2 to %d devices (got %zu); "
+                       "falling back\n", __func__, GGML_CUDA_AR_MAX_DEVICES, n_devices);
         return nullptr;
     }
 
@@ -419,7 +574,8 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
 
     auto * p = new ggml_cuda_ar_pipeline{};
     p->n_devices        = n_devices;
-    p->copy_bytes       = GGML_CUDA_AR_COPY_MAX_BYTES;
+    // n > 2: dev_tmp holds one slot per rank, so use smaller slots to bound VRAM use.
+    p->copy_bytes       = n_devices > 2 ? GGML_CUDA_AR_COPY_MAX_BYTES / 4 : GGML_CUDA_AR_COPY_MAX_BYTES;
     p->copy_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_COPY_THRESHOLD", GGML_CUDA_AR_COPY_THRESHOLD_DEFAULT);
     // 0 = use the per-call heuristic (default).  Non-zero env value forces a
     // fixed chunk size for diagnostics, with a floor at COPY_CHUNK_BYTES_MIN.
@@ -524,9 +680,10 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
             ggml_cuda_ar_pipeline_free(p);
             return nullptr;
         }
-        if (cudaMalloc(reinterpret_cast<void **>(&p->dev_tmp[i]), p->copy_bytes) != cudaSuccess) {
+        const size_t dev_tmp_bytes = n_devices > 2 ? p->copy_bytes * n_devices : p->copy_bytes;
+        if (cudaMalloc(reinterpret_cast<void **>(&p->dev_tmp[i]), dev_tmp_bytes) != cudaSuccess) {
             GGML_LOG_ERROR("%s: cudaMalloc for copy scratch failed (%zu bytes) on device %d\n",
-                           __func__, p->copy_bytes, p->devices[i]);
+                           __func__, dev_tmp_bytes, p->devices[i]);
             ggml_cuda_ar_pipeline_free(p);
             return nullptr;
         }
@@ -711,6 +868,87 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
     return true;
 }
 
+// Copy-engine path for 3 to 8 GPUs: each rank pulls all N-1 peer buffers into dev_tmp, then runs one N-way add.
+template <int N, typename T_src, typename T_dst>
+static bool ggml_cuda_ar_allreduce_copy_impl_n(
+        ggml_cuda_ar_pipeline * p,
+        ggml_backend_t        * backends,
+        T_src * const           src_buf[GGML_CUDA_MAX_DEVICES],
+        T_dst * const           dst_buf[GGML_CUDA_MAX_DEVICES],
+        const bool              compute[GGML_CUDA_MAX_DEVICES],
+        int64_t                 ne,
+        size_t                  nbytes) {
+    GGML_ASSERT(p->n_devices == N);
+    GGML_ASSERT(nbytes <= p->copy_bytes);
+    GGML_ASSERT(ne <= std::numeric_limits<int>::max());
+
+    const size_t chunk_bytes = ggml_cuda_ar_chunk_bytes(p, nbytes);
+    GGML_ASSERT(chunk_bytes > 0);
+
+    const int slot = ggml_cuda_ar_acquire_slot(p).slot;
+    const size_t copy_chunks = (nbytes + chunk_bytes - 1) / chunk_bytes;
+    GGML_ASSERT(copy_chunks <= GGML_CUDA_AR_COPY_MAX_CHUNKS);
+    const int64_t stride = (int64_t) (p->copy_bytes / sizeof(T_src));
+
+    ggml_backend_cuda_context * cuda_ctx[GGML_CUDA_AR_MAX_DEVICES] = {};
+
+    // Stage 1: D2H of each rank's contribution, after all peers have read the previous AR from host_large.
+    for (int i = 0; i < N; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        cuda_ctx[i] = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+        ggml_cuda_ar_wait_for_compute(p, cuda_ctx[i], i, slot);
+        if (p->host_large_read_done_valid) {
+            for (int r = 0; r < N; ++r) {
+                if (r != i) {
+                    CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->host_large_read_done[r]));
+                }
+            }
+        }
+        if (!compute[i]) {
+            CUDA_CHECK(cudaMemsetAsync(src_buf[i], 0, nbytes, p->streams[i]));
+        }
+        for (size_t c = 0; c < copy_chunks; ++c) {
+            const size_t offset = c * chunk_bytes;
+            const size_t this_bytes = std::min(chunk_bytes, nbytes - offset);
+            CUDA_CHECK(cudaMemcpyAsync(p->host_large[i].host + offset, reinterpret_cast<char *>(src_buf[i]) + offset,
+                this_bytes, cudaMemcpyDeviceToHost, p->streams[i]));
+            CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].cpy[c], p->streams[i]));
+        }
+    }
+
+    // Stage 2: every rank pulls all N-1 peer contributions, then one N-way add.
+    for (int i = 0; i < N; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        if (p->dev_tmp_kernel_done_valid) {
+            CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->dev_tmp_kernel_done[i]));
+        }
+        for (size_t c = 0; c < copy_chunks; ++c) {
+            const size_t offset = c * chunk_bytes;
+            const size_t this_bytes = std::min(chunk_bytes, nbytes - offset);
+            for (int k = 1; k < N; ++k) {
+                const int r = (i + k) % N;
+                CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->ev_pool[r][slot].cpy[c]));
+                CUDA_CHECK(cudaMemcpyAsync(p->dev_tmp[i] + (size_t) r * p->copy_bytes + offset,
+                    p->host_large[r].host + offset, this_bytes, cudaMemcpyHostToDevice, p->streams[i]));
+            }
+        }
+        CUDA_CHECK(cudaEventRecord(p->host_large_read_done[i], p->streams[i]));
+        CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].h2d, p->streams[i]));
+        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx[i]->stream(), p->ev_pool[i][slot].h2d));
+
+        const int block_size = 256;
+        int n_blocks = (int) std::min<int64_t>((ne + block_size - 1) / block_size, 1024);
+        ggml_cuda_ar_add_kernel_n<N, T_dst, T_src><<<n_blocks, block_size, 0, cuda_ctx[i]->stream()>>>(
+            dst_buf[i], reinterpret_cast<const T_src *>(p->dev_tmp[i]), i, stride, (int) ne);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(p->dev_tmp_kernel_done[i], cuda_ctx[i]->stream()));
+        CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, cuda_ctx[i]->stream()));
+    }
+    p->host_large_read_done_valid = true;
+    p->dev_tmp_kernel_done_valid  = true;
+    return true;
+}
+
 // Outer-level chunker: copy_impl handles up to copy_bytes per call (limited by
 // the host_large / dev_tmp allocation size).  When the full AR exceeds that,
 // slice the tensor into copy_bytes-sized pieces and call copy_impl repeatedly.
@@ -739,8 +977,16 @@ static bool ggml_cuda_ar_allreduce_copy_outer(
             src[i] = src_buf[i] + outer_start;
             dst[i] = dst_buf[i] + outer_start;
         }
-        ok = ggml_cuda_ar_allreduce_copy_impl<T_src, T_dst>(
-            p, backends, src, dst, compute, outer_ne, outer_nbytes);
+        switch (p->n_devices) {
+            case 2: ok = ggml_cuda_ar_allreduce_copy_impl<T_src, T_dst>(p, backends, src, dst, compute, outer_ne, outer_nbytes); break;
+            case 3: ok = ggml_cuda_ar_allreduce_copy_impl_n<3, T_src, T_dst>(p, backends, src, dst, compute, outer_ne, outer_nbytes); break;
+            case 4: ok = ggml_cuda_ar_allreduce_copy_impl_n<4, T_src, T_dst>(p, backends, src, dst, compute, outer_ne, outer_nbytes); break;
+            case 5: ok = ggml_cuda_ar_allreduce_copy_impl_n<5, T_src, T_dst>(p, backends, src, dst, compute, outer_ne, outer_nbytes); break;
+            case 6: ok = ggml_cuda_ar_allreduce_copy_impl_n<6, T_src, T_dst>(p, backends, src, dst, compute, outer_ne, outer_nbytes); break;
+            case 7: ok = ggml_cuda_ar_allreduce_copy_impl_n<7, T_src, T_dst>(p, backends, src, dst, compute, outer_ne, outer_nbytes); break;
+            case 8: ok = ggml_cuda_ar_allreduce_copy_impl_n<8, T_src, T_dst>(p, backends, src, dst, compute, outer_ne, outer_nbytes); break;
+            default: GGML_ABORT("unsupported n_devices: %d", p->n_devices);
+        }
     }
     return ok;
 }
@@ -752,7 +998,7 @@ bool ggml_cuda_ar_allreduce(
     GGML_ASSERT(p != nullptr);
 
     const int n = p->n_devices;
-    GGML_ASSERT(n == 2);
+    GGML_ASSERT(n >= 2 && n <= GGML_CUDA_AR_MAX_DEVICES);
 
     const ggml_type input_type = tensors[0]->type;
     GGML_ASSERT(input_type == GGML_TYPE_F32 || input_type == GGML_TYPE_F16 || input_type == GGML_TYPE_BF16);
@@ -904,6 +1150,56 @@ bool ggml_cuda_ar_allreduce(
 
             const auto [slot, token] = ggml_cuda_ar_acquire_slot(p);
             const bool last_chunk = chunk_start + (int64_t) chunk_elems == ne;
+
+            if (n > 2) {
+                ggml_cuda_ar_peer_ptrs peers = {};
+                for (int r = 0; r < n; ++r) {
+                    peers.data[r]    = p->host_buf[r].dev + (size_t) slot * p->buf_bytes;
+                    peers.arrival[r] = ggml_cuda_ar_arrival_ptr(p, slot, r);
+                }
+                for (int i = 0; i < n; ++i) {
+                    ggml_cuda_set_device(p->devices[i]);
+                    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+                    GGML_ASSERT(cuda_ctx->device == p->devices[i]);
+                    cudaStream_t stream = cuda_ctx->stream();
+                    char * data = static_cast<char *>(tensors[i]->data) + chunk_start * (int64_t) input_type_size;
+                    if (!compute_flag[i] && !use_bf16) {
+                        CUDA_CHECK(cudaMemsetAsync(data, 0, chunk_dst_bytes, stream));
+                    }
+#define LAUNCH_AR_KERNEL_N(NN, T_dst, T_wire) \
+                    ggml_cuda_ar_kernel_n<NN, T_dst, T_wire><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
+                        reinterpret_cast<const T_dst *>(data), reinterpret_cast<T_dst *>(data), \
+                        reinterpret_cast<T_wire *>(p->host_buf[i].dev + (size_t) slot * p->buf_bytes), \
+                        peers, i, static_cast<int>(chunk_elems), ggml_cuda_ar_arrival_ptr(p, slot, i), token)
+#define LAUNCH_AR_KERNEL_NT(T_dst, T_wire) \
+                    switch (n) { \
+                        case 3: LAUNCH_AR_KERNEL_N(3, T_dst, T_wire); break; \
+                        case 4: LAUNCH_AR_KERNEL_N(4, T_dst, T_wire); break; \
+                        case 5: LAUNCH_AR_KERNEL_N(5, T_dst, T_wire); break; \
+                        case 6: LAUNCH_AR_KERNEL_N(6, T_dst, T_wire); break; \
+                        case 7: LAUNCH_AR_KERNEL_N(7, T_dst, T_wire); break; \
+                        case 8: LAUNCH_AR_KERNEL_N(8, T_dst, T_wire); break; \
+                        default: GGML_ABORT("unsupported n_devices: %d", n); \
+                    }
+                    if (use_bf16) {
+                        LAUNCH_AR_KERNEL_NT(float, nv_bfloat16);
+                    } else {
+                        switch (input_type) {
+                            case GGML_TYPE_F32:  LAUNCH_AR_KERNEL_NT(float,       float);       break;
+                            case GGML_TYPE_F16:  LAUNCH_AR_KERNEL_NT(half,        half);        break;
+                            case GGML_TYPE_BF16: LAUNCH_AR_KERNEL_NT(nv_bfloat16, nv_bfloat16); break;
+                            default: GGML_ASSERT(false);
+                        }
+                    }
+#undef LAUNCH_AR_KERNEL_NT
+#undef LAUNCH_AR_KERNEL_N
+                    CUDA_CHECK(cudaGetLastError());
+                    if (last_chunk) {
+                        CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, stream));
+                    }
+                }
+                continue;
+            }
 
             for (int i = 0; i < n; ++i) {
                 const int peer = 1 - i;  // valid for n == 2 only
