@@ -68,3 +68,9 @@ void quantize_scatter_mmq_q8_1_cuda(const float *   x,
                                     int64_t         nrows_dst,
                                     int             n_expert_used,
                                     cudaStream_t    stream);
+
+// 16-byte aligned q8_1 layout for MMVQ (see quantize_q8_1_x4)
+void quantize_row_q8_1_x4_cuda(
+        const float * x, void * vy,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream);

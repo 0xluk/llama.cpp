@@ -125,6 +125,11 @@ struct common_sampler {
     // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
 
+    // > 0 when the first sampler that changes anything is top-k(prefilter_k) and nothing before it
+    // needs the full vocabulary (no grammar, reasoning budget, logit bias, active penalties/DRY/top-n-sigma).
+    // set_logits then builds only the top-k candidates in one scan instead of a 248K-entry array + partial sort.
+    int32_t prefilter_k = 0;
+
     void reset() {
         prev.clear();
 
@@ -153,6 +158,38 @@ struct common_sampler {
             for (uint32_t i = 0; i < sampled_logits_count; i++) {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
             }
+        } else if (prefilter_k > 0 && prefilter_k < n_vocab) {
+            const auto * logits = llama_get_logits_ith(ctx, idx);
+            GGML_ASSERT(logits != nullptr);
+            // keep the k largest logits; cur[0..n) is kept sorted ascending while scanning
+            const int k = prefilter_k;
+            cur.resize(k);
+            int n = 0;
+            float thr = -INFINITY;
+            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+                const float v = logits[token_id];
+                if (n == k && !(v > thr)) {
+                    continue;
+                }
+                int j = n < k ? n++ : 0;
+                if (n == k && j == 0) {
+                    // drop the smallest, shift down while larger
+                    while (j + 1 < k && cur[j + 1].logit < v) { cur[j] = cur[j + 1]; ++j; }
+                } else {
+                    while (j > 0 && cur[j - 1].logit > v) { cur[j] = cur[j - 1]; --j; }
+                }
+                cur[j] = llama_token_data{token_id, v, 0.0f};
+                if (n == k) {
+                    thr = cur[0].logit;
+                }
+            }
+            cur.resize(n);
+            // descending, as top-k's partial sort leaves it; equal logits keep the lower token id first
+            std::stable_sort(cur.begin(), cur.end(), [](const llama_token_data & a, const llama_token_data & b) {
+                return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
+            });
+            cur_p = { cur.data(), cur.size(), -1, true };
+            return;
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
@@ -443,6 +480,49 @@ struct common_sampler * common_sampler_init(
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
     };
 
+    {
+        static const bool disabled = getenv("LLAMA_SAMPLING_NO_PREFILTER") != nullptr;
+        int32_t n_suppress = 0;
+        llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+        bool ok = !disabled && grmr == nullptr && rbudget == nullptr && params.logit_bias.empty() && n_suppress == 0 &&
+                  params.mirostat == 0 && params.n_probs == 0 && !params.backend_sampling;
+        int32_t k = 0;
+        for (const auto & cnstr : params.samplers) {
+            if (!ok || k > 0) {
+                break;
+            }
+            switch (cnstr) {
+                case COMMON_SAMPLER_TYPE_PENALTIES:
+                    ok = params.penalty_last_n == 0 ||
+                         (params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f);
+                    break;
+                case COMMON_SAMPLER_TYPE_DRY:
+                    ok = params.dry_multiplier == 0.0f || params.dry_base < 1.0f || params.dry_penalty_last_n == 0;
+                    break;
+                case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                    ok = params.top_n_sigma <= 0.0f;
+                    break;
+                case COMMON_SAMPLER_TYPE_TOP_K:
+                    if (params.top_k > 0 && params.top_k <= 128) {
+                        k = params.top_k;
+                    } else {
+                        ok = false;
+                    }
+                    break;
+                default:
+                    ok = false; // anything else first: keep the full-vocabulary path
+                    break;
+            }
+        }
+        result->prefilter_k = ok ? k : 0;
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LOG_INF("%s: top-k prefilter %s (k=%d, grammar=%d, rbudget=%d, n_probs=%d)\n", __func__,
+                    result->prefilter_k > 0 ? "on" : "off", k, grmr != nullptr, rbudget != nullptr, params.n_probs);
+        }
+    }
+
     return result;
 }
 
@@ -522,9 +602,11 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
         /* .chain   = */ llama_sampler_clone(gsmpl->chain),
         /* .prev    = */ gsmpl->prev,
-        /* .cur     = */ gsmpl->cur,
-        /* .cur_p   = */ gsmpl->cur_p,
+        // cur is scratch rebuilt by set_logits; copying 248K entries (3 MB) per verify step is costly
+        /* .cur     = */ {},
+        /* .cur_p   = */ { nullptr, 0, -1, false },
         /* .rng     = */ gsmpl->rng,
+        /* .prefilter_k = */ gsmpl->prefilter_k,
     };
 }
 
@@ -542,10 +624,13 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
 
     dst->params     = src->params;
     dst->prev       = src->prev;
-    dst->cur        = src->cur;
-    dst->cur_p      = src->cur_p;
-    dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
+    if (src->cur_p.data != nullptr) {
+        dst->cur        = src->cur;
+        dst->cur_p      = src->cur_p;
+        dst->cur_p.data = dst->cur.data(); // re-point to dst's buffer
+    }
     dst->rng        = src->rng;
+    dst->prefilter_k = src->prefilter_k;
     dst->t_total_us = src->t_total_us;
 }
 

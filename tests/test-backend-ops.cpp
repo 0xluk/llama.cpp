@@ -12624,6 +12624,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // per-GPU attention of Qwen3.8-27B (D=256, 2 KV heads, GQA 6) at long context, MTP batch sizes
+    if (getenv("FA_PERF")) {
+        for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+            for (int64_t kv : {16384, 65536, 131072}) {
+                for (int64_t nb : {1, 4}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0.0f, 0.0f,
+                                                                    GGML_PREC_F32, t, t));
+                }
+            }
+        }
+        return test_cases;
+    }
+    // per-GPU decode shapes of Qwen3.8-27B with a 2-way tensor split
+    if (getenv("MMVQ_PERF")) {
+        const char * nn = getenv("MMVQ_PERF_N");
+        std::vector<int64_t> ns = nn ? std::vector<int64_t>{atoll(nn)} : std::vector<int64_t>{1, 4};
+        for (ggml_type type : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
+                               GGML_TYPE_Q2_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M}) {
+            for (auto mk : std::vector<std::pair<int64_t,int64_t>>{{8704, 5120}, {5120, 8704}, {5120, 3072}}) {
+                for (int64_t n : ns) {
+                    test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
+                }
+            }
+        }
+        return test_cases;
+    }
+
     // delta-net conv input: conv state followed by the transposed qkv of the ubatch
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 8192, 1, 1}, 512, 0, 16));
 

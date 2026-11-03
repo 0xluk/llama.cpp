@@ -1828,10 +1828,45 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
-                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+                // greedy drafting without a p_min cut only needs the argmax of the draft logits.
+                // The CPU sampler builds a full-vocab (248K) candidate array and runs top-k for every draft,
+                // which leaves the GPUs idle for ~1 ms per draft on old CPUs. Drafts never change the output
+                // (verification is exact), only the acceptance rate. LLAMA_SPEC_NO_FAST_ARGMAX=1 disables it.
+                static const bool fast_argmax_disabled = getenv("LLAMA_SPEC_NO_FAST_ARGMAX") != nullptr;
+                const bool fast_argmax = !fast_argmax_disabled && !dparams.at(seq_id).result_q &&
+                                         params.p_min <= 0.0f && backend_chains[seq_id] == nullptr;
 
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                llama_token id = LLAMA_TOKEN_NULL;
+                const float * h_row = nullptr;
+                const llama_token_data_array * cur_p = nullptr;
+
+                if (fast_argmax) {
+                    llama_synchronize(ctx_dft);
+                    const float * logits  = llama_get_logits_ith(ctx_dft, i_last[seq_id]);
+                    const int     n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+                    // 8 independent lanes keep the scan ILP-friendly; first index wins on ties, like a stable sort
+                    float bv[8]; int bi[8];
+                    for (int l = 0; l < 8; ++l) { bv[l] = -INFINITY; bi[l] = l; }
+                    int t = 0;
+                    for (; t + 8 <= n_vocab; t += 8) {
+                        for (int l = 0; l < 8; ++l) {
+                            if (logits[t + l] > bv[l]) { bv[l] = logits[t + l]; bi[l] = t + l; }
+                        }
+                    }
+                    for (; t < n_vocab; ++t) {
+                        if (logits[t] > bv[0]) { bv[0] = logits[t]; bi[0] = t; }
+                    }
+                    int best = 0;
+                    for (int l = 1; l < 8; ++l) {
+                        if (bv[l] > bv[best] || (bv[l] == bv[best] && bi[l] < bi[best])) { best = l; }
+                    }
+                    id    = bi[best];
+                    h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+                } else {
+                const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+
+                cur_p = common_sampler_get_candidates(smpl, true);
 
                 for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
                     SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
@@ -1840,7 +1875,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // add drafted token for each sequence
-                const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
+                id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
@@ -1851,6 +1886,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 common_sampler_accept(smpl, id, true);
+                }
 
                 auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
