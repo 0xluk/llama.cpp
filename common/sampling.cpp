@@ -166,7 +166,27 @@ struct common_sampler {
             cur.resize(k);
             int n = 0;
             float thr = -INFINITY;
-            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+            // blocks whose maximum cannot beat the current k-th largest are skipped (vectorizable max)
+            constexpr int BLK = 64;
+            for (llama_token b0 = 0; b0 < n_vocab; b0 += BLK) {
+            const llama_token b1 = std::min<llama_token>(b0 + BLK, n_vocab);
+            if (n == k && b1 - b0 == BLK) {
+                float bm[8] = { -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY };
+                for (int t = 0; t < BLK; t += 8) {
+                    for (int l = 0; l < 8; ++l) {
+                        const float x = logits[b0 + t + l];
+                        bm[l] = x > bm[l] ? x : bm[l];
+                    }
+                }
+                float m = bm[0];
+                for (int l = 1; l < 8; ++l) {
+                    m = bm[l] > m ? bm[l] : m;
+                }
+                if (!(m > thr)) {
+                    continue;
+                }
+            }
+            for (llama_token token_id = b0; token_id < b1; token_id++) {
                 const float v = logits[token_id];
                 if (n == k && !(v > thr)) {
                     continue;
@@ -182,6 +202,7 @@ struct common_sampler {
                 if (n == k) {
                     thr = cur[0].logit;
                 }
+            }
             }
             cur.resize(n);
             // descending, as top-k's partial sort leaves it; equal logits keep the lower token id first

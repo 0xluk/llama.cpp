@@ -12641,7 +12641,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         const char * nn = getenv("MMVQ_PERF_N");
         std::vector<int64_t> ns = nn ? std::vector<int64_t>{atoll(nn)} : std::vector<int64_t>{1, 4};
         for (ggml_type type : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
-                               GGML_TYPE_Q2_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M}) {
+                               GGML_TYPE_Q2_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M}) {
             for (auto mk : std::vector<std::pair<int64_t,int64_t>>{{8704, 5120}, {5120, 8704}, {5120, 3072}}) {
                 for (int64_t n : ns) {
                     test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
