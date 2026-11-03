@@ -665,7 +665,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     return BEST_FATTN_KERNEL_VEC;
                 }
             } else {
-                if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+                // the MMA kernel reads q8_0 K/V directly for D=256 (no per-call f16 conversion);
+                // with GQA it reads each KV head once per group, the vector kernel once per Q head.
+                const bool mma_q8_direct = cc < GGML_CUDA_CC_ADA_LOVELACE && ggml_cuda_fattn_q8_direct_ok(Q->ne[1]) &&
+                    K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 && Q->ne[0] == 256 && V->ne[0] == 256 &&
+                    gqa_opt_applies;
+                if (mma_q8_direct) {
+                    // fall through to MMA
+                } else if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                     if (Q->ne[1] <= 2) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
